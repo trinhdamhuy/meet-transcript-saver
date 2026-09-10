@@ -24,13 +24,40 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Uploads a single batch of entries with exponential backoff retry.
+ * Ensures the parent meeting row exists in Supabase first.
  * Returns true on success, false after exhausting retries.
  */
 async function uploadBatchWithRetry(
   meetingId: string,
   batch: Awaited<ReturnType<typeof transcriptDB.getUnsyncedEntries>>,
 ): Promise<boolean> {
+  // 1. Ensure parent meeting exists in Supabase
+  try {
+    const localMeeting = await transcriptDB.getMeeting(meetingId);
+    if (localMeeting) {
+      const { error: meetErr } = await supabase.from("meetings").upsert({
+        id: localMeeting.id,
+        user_id: localMeeting.userId,
+        title: localMeeting.title,
+        meet_url: localMeeting.meetUrl,
+        started_at: localMeeting.startedAt,
+        ended_at: localMeeting.endedAt,
+      });
+      if (meetErr) {
+        devError(
+          "Failed to upsert parent meeting record to Supabase:",
+          meetErr,
+        );
+        throw meetErr;
+      }
+    }
+  } catch (err) {
+    devError("Error ensuring meeting exists in Supabase:", err);
+  }
+
+  // 2. Prepare transcript payload with primary key ID
   const payload = batch.map((entry) => ({
+    id: entry.id,
     meeting_id: entry.meetingId,
     sequence: entry.sequence,
     speaker: entry.speaker ?? null,
@@ -42,25 +69,31 @@ async function uploadBatchWithRetry(
 
   while (attempt <= MAX_RETRIES) {
     try {
+      // Upsert by primary key "id" - supported natively by Supabase / Postgres
       const { error } = await supabase
         .from("transcript_entries")
-        .upsert(payload, { onConflict: "meeting_id,sequence" });
+        .upsert(payload, { onConflict: "id" });
 
-      if (error) throw error;
+      if (error) {
+        devError("Supabase upsert error on transcript_entries:", error);
+        throw error;
+      }
 
-      // Mark entries as synced in local DB.
+      // Mark entries as synced in local DB only on confirmed success.
       const sequences = batch.map((e) => e.sequence);
       await transcriptDB.markEntriesSynced(meetingId, sequences);
       devLog(
         `Synced batch of ${batch.length} entries for meeting ${meetingId}`,
       );
       return true;
-    } catch (err) {
+    } catch (err: any) {
       attempt++;
       if (attempt > MAX_RETRIES) {
         devError(
           `Failed to sync batch after ${MAX_RETRIES} retries:`,
-          JSON.stringify(err, Object.getOwnPropertyNames(err), 2),
+          err?.message || err,
+          err?.details,
+          err?.hint,
         );
         return false;
       }
@@ -141,4 +174,77 @@ export class SyncService {
 /** Factory — creates a new SyncService per meeting. */
 export function createSyncService(meetingId: string): SyncService {
   return new SyncService(meetingId);
+}
+
+/**
+ * Manually forces an immediate sync of a specific meeting and its entries to Supabase.
+ */
+export async function syncMeetingNow(meetingId: string): Promise<boolean> {
+  return forceSyncMeetingToSupabase(meetingId);
+}
+
+/**
+ * Force syncs an entire meeting and all its transcript entries to Supabase,
+ * regardless of whether they were previously marked as synced locally.
+ */
+export async function forceSyncMeetingToSupabase(
+  meetingId: string,
+): Promise<boolean> {
+  try {
+    const allEntries = await transcriptDB.getTranscriptEntries(meetingId);
+    if (allEntries.length === 0) {
+      // Still ensure parent meeting row is created on Supabase
+      const localMeeting = await transcriptDB.getMeeting(meetingId);
+      if (localMeeting) {
+        await supabase.from("meetings").upsert({
+          id: localMeeting.id,
+          user_id: localMeeting.userId,
+          title: localMeeting.title,
+          meet_url: localMeeting.meetUrl,
+          started_at: localMeeting.startedAt,
+          ended_at: localMeeting.endedAt,
+        });
+      }
+      return true;
+    }
+
+    // Reuse uploadBatchWithRetry to upload all entries in batches
+    for (let i = 0; i < allEntries.length; i += BATCH_SIZE) {
+      const batch = allEntries.slice(i, i + BATCH_SIZE);
+      const success = await uploadBatchWithRetry(meetingId, batch);
+      if (!success) return false;
+    }
+
+    return true;
+  } catch (err) {
+    devError("forceSync error:", err);
+    return false;
+  }
+}
+
+/**
+ * Syncs all local meetings and transcript entries for a user to Supabase.
+ */
+export async function syncAllMeetingsToSupabase(
+  userId: string,
+): Promise<{ successCount: number; errorCount: number }> {
+  let successCount = 0;
+  let errorCount = 0;
+
+  const localMeetings = await transcriptDB.getAllMeetings(userId);
+  for (const m of localMeetings) {
+    try {
+      const ok = await forceSyncMeetingToSupabase(m.id);
+      if (ok) {
+        successCount++;
+      } else {
+        errorCount++;
+      }
+    } catch (err) {
+      devError(`Failed to sync meeting ${m.id}:`, err);
+      errorCount++;
+    }
+  }
+
+  return { successCount, errorCount };
 }

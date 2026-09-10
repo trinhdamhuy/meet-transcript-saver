@@ -97,7 +97,7 @@ Use:
 
 ---
 
-## 5. Google Meet caption extraction
+## 5. Google Meet caption extraction & Auto-enable CC
 
 The extension must read Google Meet's existing CC DOM.
 
@@ -105,18 +105,33 @@ Expected flow:
 
 ```mermaid
 flowchart TD
-    A[Meet DOM] --> B[Caption observer]
-    B --> C[Caption parser]
-    C --> D[Normalized transcript entry]
+    A[Start Recording] --> B{CC enabled?}
+    B -- No --> C[Auto-trigger CC button/shortcut]
+    B -- Yes --> D[Caption observer]
+    C --> D
+    D --> E[Caption parser]
+    E --> F[Incremental deduplication & sequence assignment]
+    F --> G[Normalized transcript entry]
 ```
 
-The implementation must NOT assume that a selector found in an old article or GitHub project is still valid.
+### Auto-enable CC
+- When recording starts (either automatically or manually), the extension checks if Google Meet's built-in captions (CC) are currently active.
+- If captions are not active, the extension automatically activates CC (e.g., querying the CC toggle button `button[aria-label*="caption" i]` / shortcut `c` or accessibility controls) so Google Meet begins rendering captions into the DOM.
+- The user can still toggle captions manually, but starting recording guarantees captions are turned on.
 
 Selectors must be isolated in one place so they can be updated if Google Meet changes its DOM.
 
+### Speaker Normalization (Replacing "You" / "Bạn")
+- When Google Meet captions display the generic self-pronoun "You" or "Bạn" (or equivalents in other languages) for the user speaking, the extension must automatically replace it with the authenticated user's actual display name (e.g. full name or email name) so transcripts have clear identity attribution.
+
+### In-Call Only Recording Guard
+- Recording must strictly occur **only when the user is inside an active meeting room** (`/abc-defg-hij`).
+- It must **not** record on the home page (`meet.google.com`), landing page, green room / pre-join lobby (before clicking "Join now"), or after the call ends.
+- The extension automatically detects when the user enters the meeting room from the lobby and auto-starts recording (if enabled), and automatically stops recording when leaving the call.
+
 ---
 
-## 6. Caption observer
+## 6. Caption observer & Incremental Resume
 
 Use `MutationObserver` or an equivalent DOM observation mechanism.
 
@@ -127,7 +142,19 @@ The observer must detect:
 - Speaker changes
 - Caption removal/rotation where relevant
 
-The parser must avoid storing the same caption repeatedly.
+### Incremental Recording & Resume from Previous Stop Point
+- When recording is stopped/paused and subsequently restarted during an ongoing meeting (same meeting code/URL or session):
+  - The extension must resume from the last recorded position (`last_sequence` watermark).
+  - It must **not** start recording all visible DOM captions from sequence 0 again or duplicate past entries into IndexedDB/Supabase.
+  - The parser maintains a watermark/hash of previously recorded entries so that resuming only appends new dialogue spoken after the resume point.
+
+### User Pause & Disable Recording Control
+- The user must be able to pause recording or temporarily disable the extension's recording activity at any time (via Floating Widget or Popup toggle).
+- When paused/disabled:
+  - The extension completely ceases caption observation and transcript saving.
+  - No new data is synced to the database.
+  - Auto-record on joining meetings is suppressed when the extension is disabled.
+  - The UI clearly indicates the paused/disabled state with a 1-click option to resume/re-enable.
 
 ---
 
@@ -144,11 +171,11 @@ type TranscriptEntry = {
 };
 ```
 
-`sequence` must be monotonically increasing within a meeting.
+`sequence` must be monotonically increasing within a meeting, even across pause/resume cycles.
 
 ---
 
-## 8. Meeting model
+## 8. Meeting model & Session Lifecycle
 
 A meeting should contain:
 
@@ -166,17 +193,18 @@ Requirements:
 
 - Every meeting belongs to one authenticated user.
 - A meeting can have many transcript entries.
-- Ending a meeting must not delete its transcript.
+- Ending or pausing a meeting must not delete its transcript.
+- **Resume capability**: If a recording is resumed for an active or existing meeting in the same session, the existing `meeting_id` is retained and updated rather than spawning redundant duplicate meeting records.
 
 ---
 
-## 9. Transcript database model
+## 9. Transcript database model & Cascade Deletion
 
 Transcript entry:
 
 ```text
 id
-meeting_id
+meeting_id (REFERENCES meetings(id) ON DELETE CASCADE)
 sequence
 speaker
 text
@@ -184,13 +212,14 @@ started_at
 created_at
 ```
 
-Constraint:
+Constraints:
 
-```text
+```sql
 UNIQUE(meeting_id, sequence)
+FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 ```
 
-This is required for idempotent synchronization.
+- When a meeting is deleted, all associated `transcript_entries` must be automatically deleted (`ON DELETE CASCADE` at the PostgreSQL schema level, and cascading deletion in local IndexedDB).
 
 ---
 
@@ -203,6 +232,7 @@ Authenticated users:
 - Can access their own meetings.
 - Can create their own meetings.
 - Can update/end their own meetings.
+- Can delete their own meetings (triggering cascade deletion of transcripts).
 - Can access transcript entries belonging to their own meetings.
 - Cannot access another user's meetings.
 - Cannot access another user's transcripts.
@@ -219,7 +249,7 @@ Example:
 
 ```mermaid
 flowchart TD
-    A[Caption] --> B[Normalize]
+    A[Caption] --> B[Normalize & Deduplicate]
     B --> C[(IndexedDB)]
     C --> D[Sync queue]
 ```
@@ -247,7 +277,7 @@ Suggested triggers:
 
 - Every ~3 seconds
 - Every ~20 entries
-- Meeting end
+- Meeting end / pause
 
 whichever happens first.
 
@@ -405,7 +435,8 @@ Avoid manually duplicating database types when generated types can be used.
 The extension must handle:
 
 - Google Meet page changes
-- CC disabled
+- CC disabled / Auto-enabling CC failure
+- CC turned off by user during recording (gracefully pause/stop recording)
 - CC unavailable
 - Caption DOM not found
 - Unknown speaker
@@ -415,6 +446,7 @@ The extension must handle:
 - Authentication failure
 - Supabase error
 - Invalid sync payload
+- Meeting paused and resumed
 - Meeting ended unexpectedly
 
 Errors should be logged in development but should not expose sensitive credentials or tokens.
@@ -453,20 +485,27 @@ The product should clearly communicate that transcript text from captions is sto
 
 ---
 
-## 24. Future UI
+## 24. User Interfaces
 
-The initial implementation may provide:
+The product includes three main UI surfaces:
 
-- Login/logout
-- Current meeting status
-- Recording/transcript status
-- Sync status
-- Transcript preview
-- Meeting history
+### 1. In-Call Floating Transcript Widget (Tactiq-style)
+- **Overlay injected directly into Google Meet** (`content script` / shadow DOM UI).
+- **Conversation Feed**: Displays live dialogue ordered chronologically as a conversation stream with speaker avatar/initial, speaker name, timestamp, and message text.
+- **Collapsible / Expandable**: Can collapse to a compact floating pill/badge or expand into a full conversation view sidebar/panel.
+- **In-Call Controls**: Start / Pause / Resume / Stop recording, Master disable toggle, real-time sync status (e.g. entry count, synced badge).
+- **Scroll & Review**: Allows scrolling up during the call to review earlier speech segments in the meeting.
 
-A future web dashboard may be implemented separately.
+### 2. Extension Popup
+- Authentication status (Sign in / Sign out).
+- Current meeting status & quick toggle controls (Start / Pause / Disable recording).
+- Quick link to open the Local Management Dashboard.
 
-The extension itself remains WXT + React.
+### 3. Local Management Dashboard Webpage (Extension Web App)
+- Local page packaged in the extension (`chrome-extension://<id>/dashboard.html` or WXT HTML entrypoint).
+- **Meeting List**: Displays all recorded meetings with date, meeting title, URL, duration, and total transcript count.
+- **Transcript Viewer**: Full dialogue view for any selected meeting with search/filter and export capabilities.
+- **Meeting Management & Deletion**: Allows selecting individual or batch meetings and deleting them. Deleting a meeting triggers cascading deletion of all associated transcripts (`ON DELETE CASCADE` in Supabase & local IndexedDB).
 
 ---
 
@@ -475,48 +514,42 @@ The extension itself remains WXT + React.
 The project is considered complete when:
 
 ### Authentication
-
 - User can sign in with Google.
 - User session persists appropriately.
 - User can sign out.
 
-### Meeting
-
+### Meeting & Auto CC
 - Extension detects a Google Meet page.
-- User can start/track a meeting transcript.
-- Meeting metadata is stored.
+- Starting recording automatically enables Google Meet CC captions if not already enabled.
+- Turning off CC in Google Meet during recording automatically pauses/stops recording.
+- User can explicitly pause / disable recording via popup or floating widget at any time.
+- Resuming a recording in the same meeting continues from the last recorded point without re-recording or duplicating prior text.
 
-### Caption extraction
+### Live Floating UI
+- Floating widget appears inside Google Meet page.
+- Shows live transcripts ordered sequentially in chat conversation format.
+- Collapsible into compact floating pill and expandable into full view.
 
-- Built-in Google Meet CC text is detected.
-- Speaker is captured when available.
-- Caption updates do not create excessive duplicates.
-- Transcript order is preserved.
+### Local Management Dashboard
+- Local dashboard accessible via extension (`chrome-extension://...`).
+- Shows history of all recorded meetings and allows reading transcripts.
+- Allows deleting meetings with automatic cascade deletion of corresponding transcripts in both Supabase and IndexedDB.
 
-### Local persistence
-
-- Transcript survives temporary network failures.
-- Transcript remains queued until successfully synchronized.
-
-### Backend
-
-- Transcript is stored in Supabase PostgreSQL.
-- RLS prevents cross-user access.
-- RLS validates authentication and meeting ownership.
-- Repeated sync requests do not create duplicates.
+### Local Persistence & Sync
+- Transcript survives temporary network failures via IndexedDB.
+- Transcript syncs reliably to Supabase in batches with deduplication and retry mechanism.
+- Database enforces `ON DELETE CASCADE` and `UNIQUE(meeting_id, sequence)`.
 
 ### Reliability
-
-- Failed requests retry.
+- Failed requests retry with exponential backoff.
 - Extension handles missing/unexpected caption DOM gracefully.
 - Errors are visible in development logs.
 
 ### Security
-
 - No service-role key exists in extension code.
 - No database password exists in extension code.
 - `.env.local` is not committed.
-- RLS is enabled and tested.
+- RLS is enabled and tested to isolate user data.
 
 ---
 
@@ -543,14 +576,21 @@ flowchart TD
         direction TB
         subgraph GoogleMeet [Google Meet Page]
             CC[Built-in CC / Captions]
+            FloatingUI[Floating Live Transcript UI<br/>Collapsible Chat Feed]
         end
 
         subgraph Extension [WXT Extension]
             subgraph ContentScript [Content Script]
+                AutoCC[Auto-enable & CC State Controller]
                 Observer[MutationObserver]
-                Parser[Caption Parser]
+                Parser[Caption Parser & Deduplicator]
             end
             
+            subgraph DashboardPage [Local Dashboard Web App]
+                DashboardUI[Meeting List & Transcript Viewer]
+                DeleteManager[Delete Meeting & Cascade Sync]
+            end
+
             subgraph Storage [Local Storage]
                 IDB[(IndexedDB)]
                 Meeting[Meeting]
@@ -569,16 +609,22 @@ flowchart TD
         subgraph Postgres [Supabase PostgreSQL & Auth]
             Auth[Supabase Auth / JWT]
             RLS[Row Level Security]
-            Tables[(meetings & transcript_entries)]
+            Tables[(meetings & transcript_entries<br/>ON DELETE CASCADE)]
         end
     end
 
+    AutoCC -->|Enable / Detect Captions| CC
     CC --> Observer
     Observer --> Parser
+    Parser --> FloatingUI
     Parser --> IDB
     IDB --> Meeting & Entries & Queue
     Queue --> ClientSync
     ClientSync -->|Batch Upsert + JWT| Auth
     Auth --> RLS
     RLS --> Tables
+    DashboardUI --> IDB
+    DashboardUI --> ClientSync
+    DeleteManager -->|Cascade Delete| IDB & Tables
 ```
+

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file lib/storage/db.ts
  * @description IndexedDB storage layer for the meet-transcript-saver Chrome extension.
  *
@@ -173,7 +173,7 @@ export class TranscriptDB {
           entriesStore.createIndex(
             "meeting_sequence",
             ["meetingId", "sequence"],
-            { unique: true }
+            { unique: true },
           );
           // Non-unique index for retrieving all entries for a given meeting.
           entriesStore.createIndex("meeting_id", "meetingId", {
@@ -196,8 +196,8 @@ export class TranscriptDB {
       request.onblocked = () =>
         reject(
           new Error(
-            "IndexedDB open blocked - close other tabs using this extension"
-          )
+            "IndexedDB open blocked - close other tabs using this extension",
+          ),
         );
     });
   }
@@ -249,7 +249,7 @@ export class TranscriptDB {
    */
   async updateMeeting(
     id: string,
-    updates: Partial<LocalMeeting>
+    updates: Partial<LocalMeeting>,
   ): Promise<void> {
     const db = this.getDB();
     const tx = db.transaction(STORE.MEETINGS, "readwrite");
@@ -265,6 +265,89 @@ export class TranscriptDB {
     // Ensure the primary key is never accidentally overwritten.
     store.put({ ...existing, ...updates, id });
     await idbTransaction(tx);
+  }
+
+  /**
+   * Retrieves all meetings, optionally filtered by userId, sorted by startedAt descending.
+   */
+  async getAllMeetings(userId?: string): Promise<LocalMeeting[]> {
+    const db = this.getDB();
+    const tx = db.transaction(STORE.MEETINGS, "readonly");
+    const store = tx.objectStore(STORE.MEETINGS);
+
+    const allMeetings = await idbRequest<LocalMeeting[]>(store.getAll());
+    const meetings = userId
+      ? allMeetings.filter((m) => !m.userId || m.userId === userId)
+      : allMeetings;
+
+    return meetings.sort(
+      (a, b) =>
+        new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
+    );
+  }
+
+  /**
+   * Retrieves the most recent meeting for a given Google Meet URL and userId.
+   */
+  async getLatestMeetingByUrl(
+    meetUrl: string,
+    userId: string,
+  ): Promise<LocalMeeting | undefined> {
+    const meetings = await this.getAllMeetings(userId);
+    return meetings.find((m) => m.meetUrl === meetUrl);
+  }
+
+  /**
+   * Cascading delete of a meeting, all its transcript entries, and any pending sync queue items.
+   */
+  async deleteMeetingCascade(meetingId: string): Promise<void> {
+    const db = this.getDB();
+    const tx = db.transaction(
+      [STORE.MEETINGS, STORE.TRANSCRIPT_ENTRIES, STORE.SYNC_QUEUE],
+      "readwrite",
+    );
+
+    const meetingsStore = tx.objectStore(STORE.MEETINGS);
+    const entriesStore = tx.objectStore(STORE.TRANSCRIPT_ENTRIES);
+    const syncStore = tx.objectStore(STORE.SYNC_QUEUE);
+
+    // 1. Delete meeting record
+    meetingsStore.delete(meetingId);
+
+    // 2. Delete all transcript entries for this meetingId
+    const entriesIndex = entriesStore.index("meeting_id");
+    const entriesReq = entriesIndex.openCursor(IDBKeyRange.only(meetingId));
+    entriesReq.onsuccess = () => {
+      const cursor = entriesReq.result;
+      if (cursor) {
+        cursor.delete();
+        cursor.continue();
+      }
+    };
+
+    // 3. Delete any sync_queue items for this meetingId
+    const syncReq = syncStore.openCursor();
+    syncReq.onsuccess = () => {
+      const cursor = syncReq.result;
+      if (cursor) {
+        const item = cursor.value as SyncQueueItem;
+        if (item.meetingId === meetingId) {
+          cursor.delete();
+        }
+        cursor.continue();
+      }
+    };
+
+    await idbTransaction(tx);
+  }
+
+  /**
+   * Cascading delete for multiple meetings by IDs.
+   */
+  async deleteMultipleMeetingsCascade(meetingIds: string[]): Promise<void> {
+    for (const id of meetingIds) {
+      await this.deleteMeetingCascade(id);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -286,9 +369,7 @@ export class TranscriptDB {
    * Returns all transcript entries for a given meeting that have not yet been
    * uploaded, ordered by sequence number (ascending).
    */
-  async getUnsyncedEntries(
-    meetingId: string
-  ): Promise<LocalTranscriptEntry[]> {
+  async getUnsyncedEntries(meetingId: string): Promise<LocalTranscriptEntry[]> {
     const db = this.getDB();
     const tx = db.transaction(STORE.TRANSCRIPT_ENTRIES, "readonly");
     const store = tx.objectStore(STORE.TRANSCRIPT_ENTRIES);
@@ -298,7 +379,7 @@ export class TranscriptDB {
     // IDB cannot filter on two properties simultaneously without a compound
     // index that includes `synced`, so we keep the index lean and filter here.
     const allEntries = await idbRequest<LocalTranscriptEntry[]>(
-      index.getAll(meetingId)
+      index.getAll(meetingId),
     );
 
     return allEntries
@@ -312,7 +393,7 @@ export class TranscriptDB {
    */
   async markEntriesSynced(
     meetingId: string,
-    sequences: number[]
+    sequences: number[],
   ): Promise<void> {
     if (sequences.length === 0) return;
 
@@ -351,6 +432,45 @@ export class TranscriptDB {
     await idbTransaction(tx);
   }
 
+  /**
+   * Returns all transcript entries for a given meeting ordered by sequence ascending.
+   */
+  async getTranscriptEntries(
+    meetingId: string,
+  ): Promise<LocalTranscriptEntry[]> {
+    const db = this.getDB();
+    const tx = db.transaction(STORE.TRANSCRIPT_ENTRIES, "readonly");
+    const store = tx.objectStore(STORE.TRANSCRIPT_ENTRIES);
+    const index = store.index("meeting_id");
+
+    const entries = await idbRequest<LocalTranscriptEntry[]>(
+      index.getAll(meetingId),
+    );
+
+    return entries.sort((a, b) => a.sequence - b.sequence);
+  }
+
+  /**
+   * Returns the maximum sequence number among transcript entries for a meeting,
+   * or -1 if no entries exist.
+   */
+  async getMaxSequence(meetingId: string): Promise<number> {
+    const db = this.getDB();
+    const tx = db.transaction(STORE.TRANSCRIPT_ENTRIES, "readonly");
+    const store = tx.objectStore(STORE.TRANSCRIPT_ENTRIES);
+    const index = store.index("meeting_id");
+
+    const entries = await idbRequest<LocalTranscriptEntry[]>(
+      index.getAll(meetingId),
+    );
+
+    if (entries.length === 0) return -1;
+    return entries.reduce(
+      (max, e) => (e.sequence > max ? e.sequence : max),
+      -1,
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // sync_queue store
   // ---------------------------------------------------------------------------
@@ -360,7 +480,7 @@ export class TranscriptDB {
    */
   async enqueueSyncBatch(
     meetingId: string,
-    entries: LocalTranscriptEntry[]
+    entries: LocalTranscriptEntry[],
   ): Promise<void> {
     const item: SyncQueueItem = {
       meetingId,
@@ -396,7 +516,7 @@ export class TranscriptDB {
   async updateSyncBatchStatus(
     id: number,
     status: "pending" | "failed",
-    retryCount?: number
+    retryCount?: number,
   ): Promise<void> {
     const db = this.getDB();
     const tx = db.transaction(STORE.SYNC_QUEUE, "readwrite");
@@ -425,6 +545,80 @@ export class TranscriptDB {
     const tx = db.transaction(STORE.SYNC_QUEUE, "readwrite");
     tx.objectStore(STORE.SYNC_QUEUE).delete(id);
     await idbTransaction(tx);
+  }
+
+  /**
+   * Checks if recording is disabled in user preferences.
+   */
+  async getRecordingDisabled(): Promise<boolean> {
+    return getRecordingDisabled();
+  }
+
+  /**
+   * Sets the recording disabled preference.
+   */
+  async setRecordingDisabled(disabled: boolean): Promise<void> {
+    return setRecordingDisabled(disabled);
+  }
+}
+
+// =============================================================================
+// User Preferences
+// =============================================================================
+
+/**
+ * Checks if transcript recording is disabled in user preferences.
+ */
+export async function getRecordingDisabled(): Promise<boolean> {
+  try {
+    if (typeof chrome !== "undefined" && chrome.storage?.local) {
+      const res = await chrome.storage.local.get([
+        "recordingDisabled",
+        "recording_enabled",
+      ]);
+      if (res.recordingDisabled !== undefined) {
+        return Boolean(res.recordingDisabled);
+      }
+      if (res.recording_enabled !== undefined) {
+        return res.recording_enabled === false;
+      }
+    }
+    if (typeof localStorage !== "undefined") {
+      const v = localStorage.getItem("recordingDisabled");
+      if (v !== null) return v === "true";
+      const v2 = localStorage.getItem("recording_enabled");
+      if (v2 !== null) return v2 === "false";
+    }
+  } catch (err) {
+    console.warn(
+      "[TranscriptDB] Failed to get recordingDisabled preference:",
+      err,
+    );
+  }
+  return false;
+}
+
+/**
+ * Sets the transcript recording disabled toggle in user preferences.
+ */
+export async function setRecordingDisabled(disabled: boolean): Promise<void> {
+  try {
+    if (typeof chrome !== "undefined" && chrome.storage?.local) {
+      await chrome.storage.local.set({
+        recordingDisabled: disabled,
+        recording_enabled: !disabled,
+      });
+      return;
+    }
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("recordingDisabled", String(disabled));
+      localStorage.setItem("recording_enabled", String(!disabled));
+    }
+  } catch (err) {
+    console.warn(
+      "[TranscriptDB] Failed to set recordingDisabled preference:",
+      err,
+    );
   }
 }
 

@@ -50,7 +50,7 @@ export type ParsedCaption = {
 // ---------------------------------------------------------------------------
 
 /** Milliseconds a caption must be stable before it is auto-finalized. */
-const DEBOUNCE_MS = 1_500;
+const DEBOUNCE_MS = 2_500;
 
 /** How often to retry finding the captions region. */
 const RETRY_INTERVAL_MS = 2_000;
@@ -103,25 +103,57 @@ export class CaptionParser {
   /** The last emitted (speaker, text) pair for deduplication. */
   private lastEmitted: { speaker: string | null; text: string } | null = null;
 
+  /** Current authenticated user's display name to replace generic 'You' labels */
+  private currentUserDisplayName: string | null = null;
+
+  /** Known recent texts to prevent duplicate emissions upon resuming */
+  private recentHistory = new Set<string>();
+
   // ── Constructor ──────────────────────────────────────────────────────────
 
-  constructor(onCaption: (entry: ParsedCaption) => void) {
+  constructor(
+    onCaption: (entry: ParsedCaption) => void,
+    currentUserDisplayName?: string | null,
+  ) {
     this.onCaption = onCaption;
+    this.currentUserDisplayName = currentUserDisplayName ?? null;
   }
 
   // ── Public API ───────────────────────────────────────────────────────────
 
+  setUserDisplayName(name: string | null): void {
+    this.currentUserDisplayName = name;
+  }
+
   /**
-   * Start observing.  If the captions region isn't in the DOM yet, retries
-   * every 2 seconds for up to 60 seconds.
+   * Start observing captions.
+   * If initialSequence is provided (when resuming an existing meeting), sequences
+   * will continue from that number instead of 0.
    */
-  start(): void {
+  start(options?: {
+    initialSequence?: number;
+    seedRecentTexts?: string[];
+    currentUserDisplayName?: string | null;
+  }): void {
     if (this.active) return;
 
+    if (options?.currentUserDisplayName !== undefined) {
+      this.currentUserDisplayName = options.currentUserDisplayName;
+    }
+
     this.active = true;
-    this.sequence = 0;
+    this.sequence = options?.initialSequence ?? 0;
     this.lastEmitted = null;
     this.inProgress.clear();
+    this.recentHistory.clear();
+
+    if (options?.seedRecentTexts) {
+      for (const text of options.seedRecentTexts) {
+        if (text?.trim()) {
+          this.recentHistory.add(text.trim());
+        }
+      }
+    }
 
     this._tryAttach();
   }
@@ -140,6 +172,11 @@ export class CaptionParser {
     }
     this.inProgress.clear();
     this.lastEmitted = null;
+    this.recentHistory.clear();
+  }
+
+  getSequence(): number {
+    return this.sequence;
   }
 
   isActive(): boolean {
@@ -225,7 +262,7 @@ export class CaptionParser {
   private _snapshotCurrentBlocks(root: Element): void {
     const blocks = getCaptionBlocks(root);
     for (const block of blocks) {
-      const data = extractBlockData(block);
+      const data = extractBlockData(block, this.currentUserDisplayName);
       if (!data) continue;
       this._upsertInProgress(data.speaker, data.text);
     }
@@ -252,7 +289,7 @@ export class CaptionParser {
           // Text changed inside a caption block — walk up to find the block.
           const block = this._closestBlock(mutation.target);
           if (!block) continue;
-          const data = extractBlockData(block);
+          const data = extractBlockData(block, this.currentUserDisplayName);
           if (!data) continue;
           this._upsertInProgress(data.speaker, data.text);
         }
@@ -264,7 +301,7 @@ export class CaptionParser {
 
   private _handleRemovedNode(node: Element): void {
     // Try to extract data directly from removed node (it's still in memory)
-    const data = extractBlockData(node);
+    const data = extractBlockData(node, this.currentUserDisplayName);
     if (data) {
       this._finalizeByRemovedBlock(node);
       return;
@@ -272,14 +309,14 @@ export class CaptionParser {
     // The removed node might be a container — check its children
     const children = Array.from(node.querySelectorAll("div"));
     for (const child of children) {
-      if (extractBlockData(child)) {
+      if (extractBlockData(child, this.currentUserDisplayName)) {
         this._finalizeByRemovedBlock(child);
       }
     }
   }
 
   private _handleAddedNode(node: Element): void {
-    const data = extractBlockData(node);
+    const data = extractBlockData(node, this.currentUserDisplayName);
     if (data) {
       this._upsertInProgress(data.speaker, data.text);
       return;
@@ -287,7 +324,7 @@ export class CaptionParser {
     // Check children in case a container was added
     const children = Array.from(node.querySelectorAll("div"));
     for (const child of children) {
-      const childData = extractBlockData(child);
+      const childData = extractBlockData(child, this.currentUserDisplayName);
       if (childData) this._upsertInProgress(childData.speaker, childData.text);
     }
   }
@@ -353,7 +390,7 @@ export class CaptionParser {
   private _finalizeByRemovedBlock(block: Element): void {
     // The element is removed from the document but its in-memory tree is
     // still accessible. Use extractBlockData's structural heuristic.
-    const data = extractBlockData(block);
+    const data = extractBlockData(block, this.currentUserDisplayName);
     const speaker = data?.speaker ?? null;
     const key = this._speakerKey(speaker);
 
@@ -365,12 +402,20 @@ export class CaptionParser {
   // ── Emit ─────────────────────────────────────────────────────────────────
 
   private _emit(speaker: string | null, text: string, startedAt: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
     // Deduplication: skip if identical to last emission.
     if (
       this.lastEmitted &&
       this.lastEmitted.speaker === speaker &&
       this.lastEmitted.text === text
     ) {
+      return;
+    }
+
+    // Deduplication across resume: skip if already in seeded recent history
+    if (this.recentHistory.has(trimmed)) {
       return;
     }
 
@@ -382,6 +427,7 @@ export class CaptionParser {
     };
 
     this.lastEmitted = { speaker, text };
+    this.recentHistory.add(trimmed);
 
     try {
       this.onCaption(parsed);
