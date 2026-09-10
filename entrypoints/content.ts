@@ -54,6 +54,23 @@ function generateId(): string {
   return crypto.randomUUID();
 }
 
+function isExtensionValid(): boolean {
+  try {
+    return typeof chrome !== "undefined" && Boolean(chrome?.runtime?.id);
+  } catch {
+    return false;
+  }
+}
+
+function safeSendMessage(message: any): void {
+  if (!isExtensionValid()) return;
+  try {
+    chrome.runtime.sendMessage(message).catch(() => {});
+  } catch {
+    // Ignore invalidated extension context
+  }
+}
+
 function renderUI() {
   if (!reactRoot) return;
 
@@ -83,7 +100,7 @@ function renderUI() {
         renderUI();
       },
       onOpenDashboard: () => {
-        chrome.runtime.sendMessage({ action: "OPEN_DASHBOARD" });
+        safeSendMessage({ action: "OPEN_DASHBOARD" });
       },
     }),
   );
@@ -250,7 +267,7 @@ async function startOrResumeMeeting(userId: string): Promise<void> {
     });
   }
 
-  chrome.runtime.sendMessage({
+  safeSendMessage({
     action: "MEETING_STARTED",
     meetingId: meeting.id,
     meetUrl: meeting.meetUrl,
@@ -315,7 +332,7 @@ async function stopMeeting(isManualStop: boolean = false): Promise<void> {
     .update({ ended_at: endedAt })
     .eq("id", currentMeeting.id);
 
-  chrome.runtime.sendMessage({
+  safeSendMessage({
     action: "MEETING_ENDED",
     meetingId: currentMeeting.id,
   });
@@ -411,6 +428,10 @@ function setupInCallWatcher() {
   let lastInCall = isInMeetingCall();
 
   inCallObserverInterval = setInterval(async () => {
+    if (!isExtensionValid()) {
+      if (inCallObserverInterval) clearInterval(inCallObserverInterval);
+      return;
+    }
     const currentInCall = isInMeetingCall();
 
     if (currentInCall !== lastInCall) {
@@ -540,7 +561,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 // Periodic sync count update
-setInterval(async () => {
+const syncInterval = setInterval(async () => {
+  if (!isExtensionValid()) {
+    clearInterval(syncInterval);
+    return;
+  }
   if (!currentMeeting || !isRecording) return;
   try {
     const unsynced = await transcriptDB.getUnsyncedEntries(currentMeeting.id);

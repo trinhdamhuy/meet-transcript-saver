@@ -833,7 +833,7 @@ export default function App() {
                   <button
                     className="btn-action btn-action-danger"
                     onClick={() => setDeleteConfirmTarget(selectedMeeting.id)}
-                    title="Delete meeting & all transcript entries (Cascade Delete)"
+                    title="Delete meeting & all transcript entries"
                   >
                     🗑️ Delete
                   </button>
@@ -914,8 +914,7 @@ export default function App() {
               {Array.isArray(deleteConfirmTarget)
                 ? `${deleteConfirmTarget.length} selected meetings`
                 : "this meeting"}
-              ? All associated transcript entries will be permanently deleted
-              (Cascade Delete).
+              ? All associated transcript entries will be permanently deleted.
             </p>
             <div className="modal-actions">
               <button

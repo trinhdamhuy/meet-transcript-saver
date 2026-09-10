@@ -571,7 +571,11 @@ export class TranscriptDB {
  */
 export async function getRecordingDisabled(): Promise<boolean> {
   try {
-    if (typeof chrome !== "undefined" && chrome.storage?.local) {
+    if (
+      typeof chrome !== "undefined" &&
+      Boolean(chrome.runtime?.id) &&
+      chrome.storage?.local
+    ) {
       const res = await chrome.storage.local.get([
         "recordingDisabled",
         "recording_enabled",
@@ -603,7 +607,11 @@ export async function getRecordingDisabled(): Promise<boolean> {
  */
 export async function setRecordingDisabled(disabled: boolean): Promise<void> {
   try {
-    if (typeof chrome !== "undefined" && chrome.storage?.local) {
+    if (
+      typeof chrome !== "undefined" &&
+      Boolean(chrome.runtime?.id) &&
+      chrome.storage?.local
+    ) {
       await chrome.storage.local.set({
         recordingDisabled: disabled,
         recording_enabled: !disabled,

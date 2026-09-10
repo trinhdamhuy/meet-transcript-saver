@@ -10,24 +10,57 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
+function isExtensionValid(): boolean {
+  try {
+    return typeof chrome !== "undefined" && Boolean(chrome?.runtime?.id);
+  } catch {
+    return false;
+  }
+}
+
+const memoryStorage = new Map<string, string>();
+
 // Custom storage adapter using chrome.storage.local to share session between popup and content scripts
 const chromeStorageAdapter = {
   getItem: async (key: string): Promise<string | null> => {
+    if (!isExtensionValid()) {
+      return memoryStorage.get(key) ?? null;
+    }
     return new Promise((resolve) => {
-      chrome.storage.local.get([key], (result: Record<string, any>) => {
-        const val = result[key];
-        resolve(typeof val === "string" ? val : null);
-      });
+      try {
+        chrome.storage.local.get([key], (result: Record<string, any>) => {
+          if (chrome.runtime?.lastError) {
+            resolve(memoryStorage.get(key) ?? null);
+            return;
+          }
+          const val = result?.[key];
+          resolve(typeof val === "string" ? val : null);
+        });
+      } catch {
+        resolve(memoryStorage.get(key) ?? null);
+      }
     });
   },
   setItem: async (key: string, value: string): Promise<void> => {
+    memoryStorage.set(key, value);
+    if (!isExtensionValid()) return;
     return new Promise((resolve) => {
-      chrome.storage.local.set({ [key]: value }, () => resolve());
+      try {
+        chrome.storage.local.set({ [key]: value }, () => resolve());
+      } catch {
+        resolve();
+      }
     });
   },
   removeItem: async (key: string): Promise<void> => {
+    memoryStorage.delete(key);
+    if (!isExtensionValid()) return;
     return new Promise((resolve) => {
-      chrome.storage.local.remove([key], () => resolve());
+      try {
+        chrome.storage.local.remove([key], () => resolve());
+      } catch {
+        resolve();
+      }
     });
   },
 };

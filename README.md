@@ -7,9 +7,12 @@
 ## ✨ Features
 
 - ⚡ **Real-time Caption Extraction**: High-performance DOM observer built on structural heuristics—resilient to Google Meet UI class name changes and minification.
-- 🧹 **Clean Transcription**: Automatically filters out UI noise, control icons (`arrow_downward`, `Jump to bottom`), and debounces live speech streams.
-- 🗄️ **Local-First Storage (IndexedDB)**: Transcripts are saved locally first to guarantee zero data loss during network hiccups.
+- 🎛️ **Floating In-Meeting Widget**: Interactive on-screen widget directly in Google Meet for real-time transcript preview, pause/resume, CC toggling, and recording controls.
+- 📊 **Dedicated Full-Page Dashboard**: Search, filter, inspect, and export recorded meetings and transcript logs with ease.
+- 🧹 **Clean Transcription & Bubble Merging**: Automatically aggregates speech continuations into coherent dialogue turns, filters UI noise and control icons (`arrow_downward`, `Jump to bottom`).
+- 🗄️ **Local-First Storage (IndexedDB)**: Transcripts are saved locally first to guarantee zero data loss during network hiccups or tab closure.
 - 🔄 **Direct Supabase Sync**: Batch uploads entries (20 items/batch or every 3 seconds) with exponential backoff retry.
+- 🛡️ **Extension Context Resilience**: Built-in context validation prevents dangling timers and `Extension context invalidated` errors when reloading or updating the extension.
 - 🔒 **Row-Level Security (RLS)**: Enforces per-user data isolation—users can only read and write their own meeting transcripts.
 - 🔑 **Google OAuth via Supabase**: Seamless one-click authentication using `chrome.identity.launchWebAuthFlow`.
 
@@ -21,9 +24,11 @@
 flowchart LR
     A[Google Meet Live CC DOM] --> B[Caption Observer & Parser]
     B --> C[(Local IndexedDB)]
+    B --> W[Floating Meeting UI]
     C --> D[Sync Service Engine]
     D -->|Direct Client Upsert| E[(Supabase PostgreSQL)]
     E --> F[Row Level Security]
+    E --> DB[Full Dashboard UI]
 ```
 
 ---
@@ -35,13 +40,15 @@ meet-transcript-saver/
 ├── entrypoints/
 │   ├── background.ts         # Service worker & lifecycle management
 │   ├── content.ts            # Content script injected into meet.google.com
-│   └── popup/                # Extension Popup UI (React)
+│   ├── content/              # Floating Widget UI (React + Tailwind Shadow DOM)
+│   ├── dashboard/            # Full-page Dashboard UI (Search, Filter, Export)
+│   └── popup/                # Extension Popup UI (Quick Controls & Stats)
 ├── lib/
 │   ├── auth/                 # Google OAuth via chrome.identity & Supabase
 │   ├── storage/              # IndexedDB local storage layer
-│   ├── supabase/             # Supabase singleton client with chrome.storage adapter
+│   ├── supabase/             # Supabase singleton client with safe chrome.storage adapter
 │   ├── sync/                 # Sync engine with batching & backoff retry
-│   └── transcript/           # Structural DOM parser & selector heuristics
+│   └── transcript/           # Structural DOM parser & CC heuristics
 ├── supabase/
 │   └── migrations/           # PostgreSQL schema, indexes, RLS policies
 ├── types/                    # Database & environment TypeScript definitions
@@ -109,17 +116,21 @@ GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated;
 ## 🛠️ Development & Build
 
 ### Development Mode
+
 ```bash
 pnpm dev
 ```
 
 ### Production Build
+
 ```bash
 pnpm build
 ```
+
 The output will be built into `.output/chrome-mv3`.
 
 ### Load into Chrome
+
 1. Open Google Chrome and navigate to `chrome://extensions`.
 2. Enable **Developer mode** in the top right corner.
 3. Click **Load unpacked** and select the `.output/chrome-mv3` folder.
@@ -130,9 +141,9 @@ The output will be built into `.output/chrome-mv3`.
 
 1. Click the **Meet Transcript Saver** extension icon in Chrome and click **Sign in with Google**.
 2. Join any Google Meet at [meet.google.com](https://meet.google.com).
-3. Turn on **Closed Captions (CC)** on Google Meet.
-4. Open the extension popup and click **▶ Start Recording**.
-5. When the meeting ends or when you click **⏹ Stop Recording**, all remaining captions will be flushed and synced to Supabase.
+3. The extension automatically detects the in-call state, activates Closed Captions (CC), and renders the **Floating Widget**.
+4. Monitor live captions, pause/resume, or open the **Dashboard** directly from the floating widget or popup.
+5. When the meeting ends or when you click **⏹ Stop Recording**, all transcripts are persisted locally and batch-synced to Supabase.
 
 ---
 
